@@ -177,6 +177,14 @@ func TestCertificates(t *testing.T) {
 	// Create a test certificate and write it to a temp file
 	ci.ClientCert = t.TempDir() + "client.cert"
 	ci.ClientKey = t.TempDir() + "client.key"
+	// ci is the process-global ConfigInfo (ctx carries no override), and
+	// t.TempDir() is removed on cleanup -- without resetting these, any
+	// later test in this package that builds a client via NewTransportCustom
+	// fails trying to load a cert path that no longer exists.
+	defer func() {
+		ci.ClientCert = ""
+		ci.ClientKey = ""
+	}()
 	validity := 1 * time.Second
 	writeTestCert(t, ci, validity)
 

@@ -2,7 +2,9 @@ package fshttp
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -17,8 +19,9 @@ import (
 // Dialer structure contains default dialer and timeout, tclass support
 type Dialer struct {
 	net.Dialer
-	timeout time.Duration
-	tclass  int
+	timeout      time.Duration
+	minBandwidth fs.SizeSuffix
+	tclass       int
 }
 
 // NewDialer creates a Dialer structure with Timeout, Keepalive,
@@ -30,8 +33,9 @@ func NewDialer(ctx context.Context) *Dialer {
 			Timeout:   time.Duration(ci.ConnectTimeout),
 			KeepAlive: 30 * time.Second,
 		},
-		timeout: time.Duration(ci.Timeout),
-		tclass:  int(ci.TrafficClass),
+		timeout:      time.Duration(ci.Timeout),
+		minBandwidth: ci.MinBandwidth,
+		tclass:       int(ci.TrafficClass),
 	}
 	if ci.BindAddr != nil {
 		dialer.Dialer.LocalAddr = &net.TCPAddr{IP: ci.BindAddr}
@@ -85,8 +89,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	}
 
 	t := &timeoutConn{
-		Conn:    c,
-		timeout: d.timeout,
+		Conn:         c,
+		timeout:      d.timeout,
+		minBandwidth: d.minBandwidth,
 	}
 	return t, t.nudgeDeadline()
 }
@@ -94,7 +99,16 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 // A net.Conn that sets deadline for every Read/Write operation
 type timeoutConn struct {
 	net.Conn
-	timeout time.Duration
+	timeout      time.Duration
+	minBandwidth fs.SizeSuffix // bytes/sec required per timeout window; 0 disables stall detection
+
+	// windowStart/windowBytes track progress within the CURRENT timeout
+	// window for the stall check below. Not protected by a mutex: a
+	// timeoutConn's Read and Write sides are only ever driven by the
+	// single goroutine net/http's Transport assigns to a given
+	// connection at a time, same as the rest of this type's state.
+	windowStart time.Time
+	windowBytes int64
 }
 
 // Nudge the deadline for an idle timeout on by c.timeout if non-zero
@@ -105,13 +119,64 @@ func (c *timeoutConn) nudgeDeadline() error {
 	return nil
 }
 
+// progress records n bytes moved and, when minBandwidth is set, decides
+// whether to nudge the deadline forward (as nudgeDeadline always did) or
+// leave it alone because this window's progress didn't clear the minimum.
+//
+// Plain nudgeDeadline resets the deadline on ANY successful Read/Write of
+// n > 0 bytes, however small -- so a peer trickling a single byte more
+// often than --timeout can hold a connection open indefinitely with no
+// error ever surfacing (see TestTimeoutDoesNotBoundSlowTrickle). With
+// minBandwidth set, a window is only credited as "alive" if it moved at
+// least minBandwidth * elapsed bytes; otherwise the existing deadline
+// (already running from the previous nudge) is left to expire on its own,
+// which produces the same os.ErrDeadlineExceeded a truly silent connection
+// gets today -- feeding the normal --retries / --low-level-retries path
+// instead of hanging forever.
+func (c *timeoutConn) progress(n int) error {
+	if c.timeout <= 0 || n <= 0 {
+		return nil
+	}
+	if c.minBandwidth <= 0 {
+		return c.nudgeDeadline()
+	}
+
+	now := time.Now()
+	if c.windowStart.IsZero() {
+		c.windowStart = now
+	}
+	c.windowBytes += int64(n)
+
+	elapsed := now.Sub(c.windowStart)
+	if elapsed < c.timeout {
+		// Window still open -- the deadline set at its start already covers
+		// this instant, nothing to do until the window completes.
+		return nil
+	}
+
+	required := int64(float64(c.minBandwidth) * elapsed.Seconds())
+	stalled := c.windowBytes < required
+	windowBytes, windowElapsed := c.windowBytes, elapsed
+	c.windowStart = now
+	c.windowBytes = 0
+	if stalled {
+		// These n bytes are still valid to the caller (io.Reader/io.Writer
+		// both permit returning n > 0 alongside a non-nil error), but the
+		// connection itself is done: below minBandwidth for a full window
+		// is exactly the "stalled" case --timeout alone cannot see.
+		return fmt.Errorf("connection stalled: %d bytes in %v, below minimum bandwidth %v/s: %w",
+			windowBytes, windowElapsed, c.minBandwidth, os.ErrDeadlineExceeded)
+	}
+	return c.nudgeDeadline()
+}
+
 // Read bytes with rate limiting and idle timeouts
 func (c *timeoutConn) Read(b []byte) (n int, err error) {
 	// Ideally we would LimitBandwidth(len(b)) here and replace tokens we didn't use
 	n, err = c.Conn.Read(b)
 	accounting.TokenBucket.LimitBandwidth(accounting.TokenBucketSlotTransportRx, n)
-	if err == nil && n > 0 && c.timeout > 0 {
-		err = c.nudgeDeadline()
+	if err == nil && n > 0 {
+		err = c.progress(n)
 	}
 	return n, err
 }
@@ -120,8 +185,8 @@ func (c *timeoutConn) Read(b []byte) (n int, err error) {
 func (c *timeoutConn) Write(b []byte) (n int, err error) {
 	accounting.TokenBucket.LimitBandwidth(accounting.TokenBucketSlotTransportTx, len(b))
 	n, err = c.Conn.Write(b)
-	if err == nil && n > 0 && c.timeout > 0 {
-		err = c.nudgeDeadline()
+	if err == nil && n > 0 {
+		err = c.progress(n)
 	}
 	return n, err
 }

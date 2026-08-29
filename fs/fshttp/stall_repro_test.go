@@ -100,3 +100,87 @@ func TestTimeoutDoesNotBoundSlowTrickle(t *testing.T) {
 		"no retry, and no --low-level-retries engagement -- --timeout does not bound a slow trickle",
 		configuredTimeout, elapsed, float64(elapsed)/float64(configuredTimeout))
 }
+
+// TestMinBandwidthDetectsSlowTrickle is the fix side of the repro above: the
+// same dribble ("alive" but making no real progress) against the SAME
+// --timeout, but now with --min-bandwidth set. Where the previous test
+// succeeded 10x over the configured timeout, this one must now fail --
+// quickly, on the first window that doesn't clear the minimum -- and hand
+// back a real error that feeds --retries / --low-level-retries, rather than
+// letting the request run indefinitely.
+func TestMinBandwidthDetectsSlowTrickle(t *testing.T) {
+	const (
+		configuredTimeout = 300 * time.Millisecond
+		dribbleInterval   = 150 * time.Millisecond
+		dribbleBytes      = 20 // would take dribbleBytes*dribbleInterval = 3s if it ran to completion
+		// 1 byte/150ms averages ~6.7 bytes/sec; require far more than that so
+		// the very first --timeout window (300ms, at most 2 dribbled bytes)
+		// fails the check.
+		minBandwidth = 100 // bytes/sec
+	)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		reader := bufio.NewReader(conn)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil || line == "\r\n" {
+				break
+			}
+		}
+
+		body := fmt.Sprintf("Content-Length: %d\r\n\r\n", dribbleBytes)
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\n" + body))
+
+		for i := 0; i < dribbleBytes; i++ {
+			time.Sleep(dribbleInterval)
+			if _, err := conn.Write([]byte("x")); err != nil {
+				return // client gave up -- expected once the fix kicks in
+			}
+		}
+	}()
+
+	ctx := context.Background()
+	ci := fs.GetConfig(ctx)
+	ci.Timeout = fs.Duration(configuredTimeout)
+	ci.MinBandwidth = fs.SizeSuffix(minBandwidth)
+	defer func() {
+		ci.Timeout = fs.Duration(0)
+		ci.MinBandwidth = fs.SizeSuffix(0)
+	}()
+
+	client := NewClient(ctx)
+
+	start := time.Now()
+	resp, err := client.Get("http://" + ln.Addr().String() + "/")
+	if err == nil {
+		defer resp.Body.Close()
+		_, err = io.ReadAll(resp.Body)
+	}
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "request succeeded despite --min-bandwidth=%d/s against a ~6.7 bytes/sec trickle "+
+		"-- the fix did not detect the stall", minBandwidth)
+
+	fullDribbleTime := time.Duration(dribbleBytes) * dribbleInterval
+	require.Less(t, elapsed, fullDribbleTime,
+		"errored, but only after %s -- as long as letting the dribble run to completion (%s). "+
+			"Expected detection within roughly one --timeout window.", elapsed, fullDribbleTime)
+
+	t.Logf("configured --timeout=%s --min-bandwidth=%d/s; request FAILED after %s (vs %s for the "+
+		"full dribble to complete) with: %v -- stall detected and surfaced as a real error",
+		configuredTimeout, minBandwidth, elapsed, fullDribbleTime, err)
+
+	<-serverDone // let the server goroutine's Write see the closed conn and exit before the test does
+}

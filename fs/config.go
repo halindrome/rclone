@@ -122,6 +122,11 @@ var ConfigOptionsInfo = Options{{
 	Help:    "IO idle timeout",
 	Groups:  "Networking",
 }, {
+	Name:    "min_bandwidth",
+	Default: SizeSuffix(0),
+	Help:    "Minimum bandwidth to require within each --timeout window before treating the connection as stalled (e.g. 1k). 0 disables (default)",
+	Groups:  "Networking",
+}, {
 	Name:    "expect_continue_timeout",
 	Default: 1 * time.Second,
 	Help:    "Timeout when using expect / 100-continue in HTTP",
@@ -586,6 +591,7 @@ type ConfigInfo struct {
 	Transfers                  int               `config:"transfers"`
 	ConnectTimeout             Duration          `config:"contimeout"` // Connect timeout
 	Timeout                    Duration          `config:"timeout"`    // Data channel timeout
+	MinBandwidth               SizeSuffix        `config:"min_bandwidth"` // Minimum bytes/sec required per --timeout window, 0 disables
 	ExpectContinueTimeout      Duration          `config:"expect_continue_timeout"`
 	Dump                       DumpFlags         `config:"dump"`
 	InsecureSkipVerify         bool              `config:"no_check_certificate"` // Skip server certificate verification
